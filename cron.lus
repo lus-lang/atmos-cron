@@ -33,7 +33,6 @@
 --- @lus 2.0
 --- @license 0BSD
 --- @repository https://github.com/lus-lang/atmos-cron
---- @permission network:udp Opens an unbound UDP socket whose receive timeout is the timer of `cron.ticks` and `cron.schedule`. A loop with its own `sleep` option needs no permission.
 
 local M = {}
 
@@ -532,33 +531,10 @@ Cron.next = M.next
 
 -- Scheduling -----------------------------------------------------------------------
 
--- Returns a detached coroutine that ends after `seconds`. Closing it ends the
--- wait early. The body waits on the receive timeout of an unbound UDP socket.
--- `coroutine.sleep(seconds)` replaces this function when the runtime has it.
-local function timer(seconds)
-    return coroutine.detach(coroutine.create(function()
-        local ok, sock = catch network.udp.open()
-        if not ok then
-            return sock
-        end
-        local held <close> = sock
-        sock:settimeout(seconds)
-        catch sock:receive(1)
-    end))
-end
-
-local Guard = { __close = function(g) coroutine.close(g[1]) end }
-
--- Suspends the caller for `seconds`. A caller that is cancelled takes its timer along.
+-- Suspends the caller for `seconds`. Closing a detached caller closes its
+-- sleep too.
 local function sleep(seconds)
-    local t = timer(seconds)
-    local guard <close> = setmetatable({ t }, Guard)
-    -- The timer returns a message when it cannot start.
-    if ok, err = coroutine.resume(t) then
-        if err then
-            error(err, 0)
-        end
-    end
+    coroutine.resume(coroutine.sleep(seconds))
 end
 
 local function now_seconds()
@@ -586,11 +562,9 @@ local MAX_SLEEP = 60
 --- - `after`, the time from which the first match counts, in any form that `cron.next` accepts. It defaults to the current time. A time in the past counts as the current time.
 --- - `limit`, the number of matches after which the iterator returns nil.
 --- - `clock`, a function that returns the time in Unix seconds, which defaults to the system clock.
---- - `sleep`, a function that suspends its caller for a number of seconds. The default waits on the receive timeout of an unbound UDP socket, which needs the `network:udp` permission.
+--- - `sleep`, a function that suspends its caller for a number of seconds. The default waits on `coroutine.sleep`.
 ---
---- The call raises the errors of `cron.parse` and of `time.zone`. With the
---- default timer, the first turn raises a permission error when the program
---- lacks `network:udp`.
+--- The call raises the errors of `cron.parse` and of `time.zone`.
 --- @param expression string|table An expression or an object from `cron.parse`.
 --- @param options table? The options.
 --- @return function The iterator.
@@ -614,7 +588,7 @@ function M.ticks(expression, options)
         if target == nil then
             return nil
         end
-        -- The wall clock may jump while the timer runs, so sleep in bounded
+        -- The wall clock may jump during a sleep, so sleep in bounded
         -- steps and read the clock again after each one.
         while true do
             local remaining = target - clock()

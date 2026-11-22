@@ -21,6 +21,6 @@ end, { zone = "America/New_York" })
 coroutine.close(cleanup)
 ```
 
-The package requires Lus 2.0 and declares the permission `network:udp`, which only the timer of `cron.ticks` and `cron.schedule` uses. It never calls `pledge`, so the program that loads it keeps control of its permissions.
+The package requires Lus 2.0 and needs no permissions. It never calls `pledge`, so the program that loads it keeps control of its permissions.
 
 The reference is in the doc comments of `cron.lus`, which `lus doc cron.lus` prints.
