@@ -1,0 +1,660 @@
+--- Parses cron expressions, computes their next times in a time zone, and runs functions on a schedule.
+---
+--- An expression has five fields, `minute hour day-of-month month
+--- day-of-week`, or six with a leading `second` field. `cron.parse` reads one
+--- into an object. `cron.next` returns the next matching time as a
+--- `time.zoned` value. `cron.ticks` returns an iterator that sleeps until each
+--- match, and `cron.schedule` runs such a loop in a detached coroutine.
+---
+--- A field holds `*`, a value, a range `a-b`, a step `*/n`, `a-b/n`, or `a/n`,
+--- or a list of these separated by commas. Months accept the names `jan` to
+--- `dec`. Days of the week accept `sun` to `sat` and the numbers 0 to 7,
+--- where 0 and 7 are both Sunday. `?` means `*` in the two day fields. The
+--- day-of-month field also accepts `L`, the last day of the month, and `15W`,
+--- the weekday nearest to the 15th. The day-of-week field also accepts `5L`,
+--- the last Friday of the month, and `5#2`, the second Friday. When both day
+--- fields are restricted, a day matches when either field matches. The
+--- nicknames are `@yearly`, `@annually`, `@monthly`, `@weekly`, `@daily`,
+--- `@midnight`, and `@hourly`.
+---
+--- Times are wall-clock times in the zone of the call. Daylight saving time
+--- changes follow the rules of Vixie cron. They depend on the hour field.
+--- An expression whose hour field starts with `*` is an interval. It follows
+--- the clock through a change, so `*/15 * * * *` runs every 15 minutes of
+--- elapsed time, including in both passes through a repeated hour. An
+--- expression with a fixed hour names times of day. A time that the zone
+--- skips runs once at the instant the skip ends, so `30 2 * * *` runs at
+--- 03:00 on the day the clock jumps from 02:00 to 03:00. A time that the zone
+--- repeats runs once, in the first pass.
+---
+--- @package cron
+--- @version 0.1.0
+--- @lus 2.0
+--- @license 0BSD
+--- @repository https://github.com/lus-lang/atmos-cron
+--- @permission network:udp Opens an unbound UDP socket whose receive timeout is the timer of `cron.ticks` and `cron.schedule`. A loop with its own `sleep` option needs no permission.
+
+local M = {}
+
+local CronError = {}
+CronError.__index = CronError
+CronError.__tostring = function(e) return e.message end
+
+--- Returns true if `value` is an error object that `cron.parse` raised.
+---
+--- The error object has a `message` and the `expression` that failed.
+--- @param value any The value to test.
+--- @return boolean
+function M.iserror(value)
+    return getmetatable(value) == CronError
+end
+
+local NICKNAMES = {
+    ["@yearly"] = "0 0 1 1 *",
+    ["@annually"] = "0 0 1 1 *",
+    ["@monthly"] = "0 0 1 * *",
+    ["@weekly"] = "0 0 * * 0",
+    ["@daily"] = "0 0 * * *",
+    ["@midnight"] = "0 0 * * *",
+    ["@hourly"] = "0 * * * *",
+}
+
+local MONTHS = { jan = 1, feb = 2, mar = 3, apr = 4, may = 5, jun = 6, jul = 7, aug = 8, sep = 9, oct = 10, nov = 11, dec = 12 }
+local DAYS = { sun = 0, mon = 1, tue = 2, wed = 3, thu = 4, fri = 5, sat = 6 }
+
+-- name, low, high, names
+local SPECS = {
+    { "second", 0, 59 },
+    { "minute", 0, 59 },
+    { "hour", 0, 23 },
+    { "day-of-month", 1, 31 },
+    { "month", 1, 12, MONTHS },
+    { "day-of-week", 0, 7, DAYS },
+}
+
+local function number(text, spec)
+    local n = math.tointeger(tonumber(text))
+    if n == nil and spec[4] then
+        n = spec[4][text]
+    end
+    if n == nil or n < spec[2] or n > spec[3] or text:find("^[%d%a]+$") == nil then
+        return nil, `bad $(spec[1]) value '$text'`
+    end
+    return n
+end
+
+-- Parses one field into { set, star, next } plus the special day forms.
+local function parse_field(text, spec)
+    local lo, hi = spec[2], spec[3]
+    local is_dow = spec[4] == DAYS
+    local is_dom = spec[1] == "day-of-month"
+    local field = { set = {}, star = false }
+    local first = text:sub(1, 1)
+    field.star = first == "*" or first == "?"
+    for item in (text .. ","):gmatch("([^,]*),") do
+        local body, step = item, 1
+        local slash = item:find("/", 1, true)
+        if slash then
+            body = item:sub(1, slash - 1)
+            step = math.tointeger(tonumber(item:sub(slash + 1)))
+            if step == nil or step < 1 then
+                return nil, `bad step in $(spec[1]) field '$item'`
+            end
+        end
+        local a, b
+        if body == "*" or (body == "?" and (is_dow or is_dom)) then
+            a, b = lo, is_dow and 6 or hi
+        elseif is_dom and body == "l" then
+            field.last = true
+        elseif is_dom and body:find("^%d+w$") then
+            local n, err = number(body:sub(1, -2), spec)
+            if n == nil then
+                return nil, err
+            end
+            field.weekdays = field.weekdays or {}
+            field.weekdays[#field.weekdays + 1] = n
+        elseif is_dow and body:find("^%w+l$") then
+            local n, err = number(body:sub(1, -2), spec)
+            if n == nil then
+                return nil, err
+            end
+            field.last_days = field.last_days or {}
+            field.last_days[n % 7] = true
+        elseif is_dow and body:find("#", 1, true) then
+            local day, nth = body:match("^(%w+)#([1-5])$")
+            local n, err = number(day or "", spec)
+            if n == nil then
+                return nil, err or `bad $(spec[1]) value '$body'`
+            end
+            field.nth = field.nth or {}
+            field.nth[#field.nth + 1] = { n % 7, math.tointeger(tonumber(nth)) }
+        else
+            local low, high = body:match("^([^-]+)-([^-]+)$")
+            local err
+            a, err = number(low or body, spec)
+            if a == nil then
+                return nil, err
+            end
+            if high then
+                b, err = number(high, spec)
+                if b == nil then
+                    return nil, err
+                end
+                if is_dow and b < a then
+                    b = b + 7
+                end
+                if b < a then
+                    return nil, `bad range in $(spec[1]) field '$body'`
+                end
+            elseif slash then
+                b = is_dow and 6 or hi
+            else
+                b = a
+            end
+        end
+        if a then
+            for v = a, b, step do
+                field.set[is_dow and v % 7 or v] = true
+            end
+        end
+    end
+    -- next[v - lo + 1] is the smallest member at or above v, or false.
+    local following = false
+    local nexts = {}
+    for v = hi, lo, -1 do
+        if field.set[v] then
+            following = v
+        end
+        nexts[v - lo + 1] = following
+    end
+    field.next = nexts
+    field.first = following
+    return field
+end
+
+local Cron = {}
+Cron.__index = Cron
+Cron.__tostring = function(c) return c.expression end
+
+--- Parses a cron expression and returns an object.
+---
+--- The object has the field `expression`, the text it was parsed from, and
+--- the boolean `seconds`, which is true for a six-field expression. Its
+--- method `c:next(after, zone)` works as `cron.next` does. `tostring` returns
+--- the expression. Names and nicknames are read without regard to case.
+---
+--- The call raises an error object, which `cron.iserror` recognizes, when the expression has a wrong number of fields, a value out of range, or a malformed item.
+--- @param expression string The expression, such as `"*/5 * * * *"` or `"@daily"`.
+--- @return table
+function M.parse(expression)
+    if type(expression) ~= "string" then
+        error("bad argument #1 to 'parse' (string expected)", 2)
+    end
+    local text = expression:lower():match("^%s*(.-)%s*$")
+    text = NICKNAMES[text] or text
+    local parts = {}
+    for part in text:gmatch("%S+") do
+        parts[#parts + 1] = part
+    end
+    local message
+    local c = { expression = expression, seconds = #parts == 6 }
+    if #parts ~= 5 and #parts ~= 6 then
+        message = `expected 5 or 6 fields, found $(#parts)`
+    else
+        local shift = 6 - #parts
+        local fields = {}
+        for i = 1, #parts do
+            local field, err = parse_field(parts[i], SPECS[i + shift])
+            if field == nil then
+                message = err
+                break
+            end
+            fields[i + shift] = field
+        end
+        if message == nil then
+            c.sec = fields[1] or parse_field("0", SPECS[1])
+            c.min, c.hour, c.dom, c.month, c.dow = fields[2], fields[3], fields[4], fields[5], fields[6]
+            c.dom_special = c.dom.last or c.dom.weekdays ~= nil
+            c.dow_special = c.dow.last_days ~= nil or c.dow.nth ~= nil
+            if not c.month.first then
+                message = "the month field is empty"
+            end
+        end
+    end
+    if message then
+        error(setmetatable({ message = `invalid cron expression '$expression': $message`, expression = expression }, CronError), 2)
+    end
+    return setmetatable(c, Cron)
+end
+
+-- Calendar arithmetic on the proleptic Gregorian calendar ----------------------------
+
+local function days_from_civil(y, m, d)
+    if m <= 2 then
+        y = y - 1
+    end
+    local era = y // 400
+    local yoe = y - era * 400
+    local doy = (153 * (m > 2 and m - 3 or m + 9) + 2) // 5 + d - 1
+    local doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+    return era * 146097 + doe - 719468
+end
+
+local function civil_from_days(z)
+    z = z + 719468
+    local era = z // 146097
+    local doe = z - era * 146097
+    local yoe = (doe - doe // 1460 + doe // 36524 - doe // 146096) // 365
+    local doy = doe - (365 * yoe + yoe // 4 - yoe // 100)
+    local mp = (5 * doy + 2) // 153
+    local d = doy - (153 * mp + 2) // 5 + 1
+    local m = mp < 10 and mp + 3 or mp - 9
+    return yoe + era * 400 + (m <= 2 and 1 or 0), m, d
+end
+
+local MONTH_DAYS = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 }
+
+local function days_in_month(y, m)
+    if m == 2 and y % 4 == 0 and (y % 100 ~= 0 or y % 400 == 0) then
+        return 29
+    end
+    return MONTH_DAYS[m]
+end
+
+-- Tells whether day `d`, which falls on weekday `wd`, is the weekday nearest to day `n`.
+local function nearest_weekday(n, d, wd, dim)
+    if wd == 0 or wd == 6 then
+        return false
+    end
+    if n > dim then
+        n = dim
+    end
+    if d == n then
+        return true
+    end
+    -- A Saturday target moves to the Friday before, and a Sunday target to the
+    -- Monday after. A target at an end of the month stays inside the month.
+    if wd == 5 and d == n - 1 then
+        return true
+    end
+    if wd == 1 and (d == n + 1 or (n == 1 and d == 3)) then
+        return true
+    end
+    return wd == 5 and n == dim and d == n - 2
+end
+
+local function day_matches(c, d, wd, dim)
+    local dom, dow from c
+    local dom_ok = dom.set[d] == true
+    if not dom_ok and c.dom_special then
+        if dom.last and d == dim then
+            dom_ok = true
+        elseif dom.weekdays then
+            for i = 1, #dom.weekdays do
+                if nearest_weekday(dom.weekdays[i], d, wd, dim) then
+                    dom_ok = true
+                    break
+                end
+            end
+        end
+    end
+    local dow_ok = dow.set[wd] == true
+    if not dow_ok and c.dow_special then
+        if dow.last_days and dow.last_days[wd] and d + 7 > dim then
+            dow_ok = true
+        elseif dow.nth then
+            for i = 1, #dow.nth do
+                local item = dow.nth[i]
+                if item[1] == wd and (d - 1) // 7 + 1 == item[2] then
+                    dow_ok = true
+                    break
+                end
+            end
+        end
+    end
+    if dom.star then
+        return dow_ok
+    elseif dow.star then
+        return dom_ok
+    end
+    return dom_ok or dow_ok
+end
+
+local SEARCH_YEARS = 12
+
+-- Returns the first matching wall-clock second at or after `naive`, a count of
+-- seconds since 1970 on a clock without zones, or nil.
+local function next_wall(c, naive)
+    local days = naive // 86400
+    local rest = naive - days * 86400
+    local y, mo, d = civil_from_days(days)
+    local h, mi, s = rest // 3600, rest % 3600 // 60, rest % 60
+    local months, hours, minutes, seconds = c.month.next, c.hour.next, c.min.next, c.sec.next
+    local limit = y + SEARCH_YEARS
+    while y <= limit do
+        local nm = months[mo]
+        if nm ~= mo then
+            if not nm then
+                y = y + 1
+                nm = c.month.first
+            end
+            mo, d, h, mi, s = nm, 1, 0, 0, 0
+        end
+        local dim = days_in_month(y, mo)
+        local first = days_from_civil(y, mo, 1)
+        while d <= dim do
+            if day_matches(c, d, (first + d + 3) % 7, dim) then
+                while h <= 23 do
+                    local nh = hours[h + 1]
+                    if not nh then
+                        break
+                    end
+                    if nh ~= h then
+                        h, mi, s = nh, 0, 0
+                    end
+                    if nmi = mi <= 59 and minutes[mi + 1] then
+                        if nmi ~= mi then
+                            mi, s = nmi, 0
+                        end
+                        if ns = seconds[s + 1] then
+                            return (first + d - 1) * 86400 + h * 3600 + mi * 60 + ns
+                        end
+                        mi, s = mi + 1, 0
+                    else
+                        h, mi, s = h + 1, 0, 0
+                    end
+                end
+            end
+            d, h, mi, s = d + 1, 0, 0, 0
+        end
+        mo, d = mo + 1, 1
+        if mo > 12 then
+            mo, y = 1, y + 1
+        end
+    end
+    return nil
+end
+
+-- Time zones -----------------------------------------------------------------------
+
+local instant = time.instant
+
+-- Returns the first second in (lo, hi] whose offset differs from that of `lo`.
+local function first_transition(zone, lo, hi)
+    local before = zone:offset(instant(lo))
+    local t = lo
+    while true do
+        local n = t + 86400
+        if n > hi then
+            n = hi
+        end
+        if zone:offset(instant(n)) ~= before then
+            lo, hi = t, n
+            break
+        end
+        if n == hi then
+            return hi
+        end
+        t = n
+    end
+    while hi - lo > 1 do
+        local mid = (lo + hi) // 2
+        if zone:offset(instant(mid)) == before then
+            lo = mid
+        else
+            hi = mid
+        end
+    end
+    return hi
+end
+
+-- Returns the epoch second of the first match after `after`, or nil.
+local function next_epoch(c, after, zone)
+    if zone == nil then
+        return next_wall(c, after + 1)
+    end
+    local off = zone:offset(instant(after))
+    local start = after + off + 1
+    if c.hour.star then
+        -- An interval follows the clock across each change of offset.
+        local base = after
+        for _ = 1, 8 do
+            local wall = next_wall(c, start)
+            if wall == nil then
+                return nil
+            end
+            local at = wall - off
+            if zone:offset(instant(at)) == off then
+                return at
+            end
+            base = first_transition(zone, base, at)
+            off = zone:offset(instant(base))
+            start = base + off
+        end
+        return nil
+    end
+    for _ = 1, 8 do
+        local wall = next_wall(c, start)
+        if wall == nil then
+            return nil
+        end
+        -- Resolve the wall-clock time with the offsets in force a day before
+        -- and a day after it. A repeated time has two instants and resolves
+        -- to the first. A skipped time has none and runs when the skip ends.
+        local guess = wall - off
+        local before, later = zone:offset(instant(guess - 86400)), zone:offset(instant(guess + 86400))
+        local at = wall - before
+        if before ~= later then
+            local other = wall - later
+            local valid = zone:offset(instant(at)) == before
+            local other_valid = zone:offset(instant(other)) == later
+            if valid and other_valid then
+                at = at < other and at or other
+            elseif other_valid then
+                at = other
+            elseif not valid then
+                at = first_transition(zone, at < other and at or other, at < other and other or at)
+            end
+        end
+        if at > after then
+            return at
+        end
+        start = wall + 1
+    end
+    return nil
+end
+
+local zones = {}
+
+local function resolve_zone(zone)
+    if zone == nil then
+        return nil
+    end
+    if type(zone) == "string" then
+        local z = zones[zone]
+        if z == nil then
+            z = time.zone(zone)
+            zones[zone] = z
+        end
+        return z
+    end
+    return zone
+end
+
+local function epoch_of(after)
+    if after == nil then
+        return time.now():epoch()
+    end
+    if type(after) == "number" then
+        return math.floor(after)
+    end
+    if after.instant then
+        return after:instant():epoch()
+    end
+    return after:epoch()
+end
+
+local function next_zoned(c, after, zone)
+    local at = next_epoch(c, epoch_of(after), zone)
+    if at == nil then
+        return nil
+    end
+    return instant(at):at(zone or 0)
+end
+
+--- Returns the first time after `after` that an expression matches.
+---
+--- `after` is a `time.instant`, a `time.zoned` value, or a number of Unix
+--- seconds. It defaults to the current time. The result is strictly
+--- later than `after`, so passing a result back gives the following match.
+--- `zone` is the zone whose wall clock the expression describes. It is a zone
+--- from `time.zone`, an IANA name such as `"Europe/Paris"`, or nil for UTC.
+--- The package overview states what happens at a daylight saving change.
+---
+--- An expression that is not a parsed object is parsed first, which raises the errors of `cron.parse`. An unknown zone name raises the error of `time.zone`.
+--- @param expression string|table An expression or an object from `cron.parse`.
+--- @param after any? The time to start from.
+--- @param zone any? The zone, which defaults to UTC.
+--- @return any A `time.zoned` value in the zone, or nil when the expression matches no date in the next 12 years, as `0 0 30 2 *` does.
+function M.next(expression, after, zone)
+    if getmetatable(expression) ~= Cron then
+        expression = M.parse(expression)
+    end
+    return next_zoned(expression, after, resolve_zone(zone))
+end
+
+Cron.next = M.next
+
+-- Scheduling -----------------------------------------------------------------------
+
+-- Returns a detached coroutine that ends after `seconds`. Closing it ends the
+-- wait early. The body waits on the receive timeout of an unbound UDP socket.
+-- `coroutine.sleep(seconds)` replaces this function when the runtime has it.
+local function timer(seconds)
+    return coroutine.detach(coroutine.create(function()
+        local ok, sock = catch network.udp.open()
+        if not ok then
+            return sock
+        end
+        local held <close> = sock
+        sock:settimeout(seconds)
+        catch sock:receive(1)
+    end))
+end
+
+local Guard = { __close = function(g) coroutine.close(g[1]) end }
+
+-- Suspends the caller for `seconds`. A caller that is cancelled takes its timer along.
+local function sleep(seconds)
+    local t = timer(seconds)
+    local guard <close> = setmetatable({ t }, Guard)
+    -- The timer returns a message when it cannot start.
+    if ok, err = coroutine.resume(t) then
+        if err then
+            error(err, 0)
+        end
+    end
+end
+
+local function now_seconds()
+    local t = time.now()
+    return t:epoch() + t:nanos() / 1e9
+end
+
+local MAX_SLEEP = 60
+
+--- Returns an iterator that waits for each match of an expression and returns its time.
+---
+--- Each call of the iterator sleeps until the next match and returns it as a
+--- `time.zoned` value, so a `for` loop runs its body once per match. Inside a
+--- detached coroutine the sleep suspends the coroutine while the others run.
+--- In the main chunk it blocks the chunk and runs the detached coroutines
+--- meanwhile. A match that passes while the body of the loop runs is skipped,
+--- so the following turn waits for the first match after the body ended. The
+--- loop ends when the expression has no further match, and `break` leaves it
+--- at any time.
+---
+--- The options are:
+---
+--- - `zone`, a zone or an IANA name, which defaults to UTC.
+--- - `after`, the time from which the first match counts, in any form that `cron.next` accepts. It defaults to the current time, and a time in the past counts as the current time.
+--- - `limit`, the number of matches after which the iterator returns nil.
+--- - `clock`, a function that returns the time in Unix seconds, which defaults to the system clock.
+--- - `sleep`, a function that suspends its caller for a number of seconds. The default waits on the receive timeout of an unbound UDP socket, which needs the `network:udp` permission.
+---
+--- The call raises the errors of `cron.parse` and of `time.zone`. With the default timer, the first turn raises a permission error when the program lacks `network:udp`.
+--- @param expression string|table An expression or an object from `cron.parse`.
+--- @param options table? The options.
+--- @return function The iterator.
+function M.ticks(expression, options)
+    if getmetatable(expression) ~= Cron then
+        expression = M.parse(expression)
+    end
+    options = options or {}
+    local zone = resolve_zone(options.zone)
+    local clock = options.clock or now_seconds
+    local wait = options.sleep or sleep
+    local limit = options.limit
+    local last = options.after ~= nil and epoch_of(options.after) or math.mininteger
+    local count = 0
+    return function()
+        if limit and count >= limit then
+            return nil
+        end
+        local now = math.floor(clock())
+        local target = next_epoch(expression, now > last and now or last, zone)
+        if target == nil then
+            return nil
+        end
+        -- The wall clock may jump while the timer runs, so sleep in bounded
+        -- steps and read the clock again after each one.
+        while true do
+            local remaining = target - clock()
+            if remaining <= 0 then
+                break
+            end
+            wait(remaining < MAX_SLEEP and remaining or MAX_SLEEP)
+        end
+        last = target
+        count = count + 1
+        return instant(target):at(zone or 0)
+    end
+end
+
+local function run_schedule(expression, fn, options)
+    for at in M.ticks(expression, options) do
+        fn(at)
+    end
+end
+
+--- Runs a function at every match of an expression and returns the detached coroutine that does so.
+---
+--- The coroutine runs `for at in cron.ticks(expression, options) do fn(at)
+--- end`, so the function receives each scheduled time as a `time.zoned` value
+--- and the options are those of `cron.ticks`. The program stays alive while
+--- the coroutine runs, as it does for every detached coroutine.
+---
+--- The coroutine is the handle of the schedule. `coroutine.close` on it
+--- stops the schedule, also in the middle of a sleep. `coroutine.resume` on
+--- it waits until the schedule has ended, which happens after `limit` runs
+--- or when the expression has no further match. An error that the function
+--- raises ends the coroutine. The resume then returns false and the error,
+--- and an error that no resume collects stops the program. A function that
+--- wraps its work in `catch` keeps its schedule running past errors.
+---
+--- The call raises the errors of `cron.parse` and of `time.zone`.
+--- @param expression string|table An expression or an object from `cron.parse`.
+--- @param fn function The function to run.
+--- @param options table? The options of `cron.ticks`.
+--- @return thread The detached coroutine.
+function M.schedule(expression, fn, options)
+    if getmetatable(expression) ~= Cron then
+        expression = M.parse(expression)
+    end
+    if options and options.zone then
+        resolve_zone(options.zone)
+    end
+    return coroutine.detach(coroutine.create(run_schedule), expression, fn, options)
+end
+
+return M

@@ -1,0 +1,388 @@
+local ROOT = string.match(TEST_DIR, "^(.*)[/\\][^/\\]*$")
+pledge("load", "fs:read=" .. ROOT .. "/*", "network:udp")
+package.path = ROOT .. "/?.lus;" .. package.path
+
+local cron = require("cron")
+
+-- Returns the next `count` matches after the ISO time `after`, joined by spaces.
+local function run(expression, after, zone, count)
+    local t = time.parse(after)
+    local out = {}
+    for _ = 1, count do
+        t = cron.next(expression, t, zone)
+        if t == nil then
+            out[#out + 1] = "nil"
+            break
+        end
+        out[#out + 1] = t:iso()
+    end
+    return table.concat(out, " ")
+end
+
+local next_cases = {
+    every_minute = { "* * * * *", "2026-01-01T00:00:30Z", false, "2026-01-01T00:01:00Z 2026-01-01T00:02:00Z" },
+    strictly_after = { "0 0 * * *", "2026-01-01T00:00:00Z", false, "2026-01-02T00:00:00Z" },
+    step = { "*/20 * * * *", "2026-01-01T00:05:00Z", false, "2026-01-01T00:20:00Z 2026-01-01T00:40:00Z 2026-01-01T01:00:00Z" },
+    range_step = { "10-30/10 3 * * *", "2026-01-01T00:00:00Z", false, "2026-01-01T03:10:00Z 2026-01-01T03:20:00Z 2026-01-01T03:30:00Z 2026-01-02T03:10:00Z" },
+    value_step = { "0 6/8 * * *", "2026-01-01T00:00:00Z", false, "2026-01-01T06:00:00Z 2026-01-01T14:00:00Z 2026-01-01T22:00:00Z 2026-01-02T06:00:00Z" },
+    list = { "5,35 9,17 * * *", "2026-01-01T09:10:00Z", false, "2026-01-01T09:35:00Z 2026-01-01T17:05:00Z 2026-01-01T17:35:00Z 2026-01-02T09:05:00Z" },
+    seconds = { "*/20 * * * * *", "2026-01-01T00:00:00Z", false, "2026-01-01T00:00:20Z 2026-01-01T00:00:40Z 2026-01-01T00:01:00Z" },
+    seconds_fixed = { "30 15 10 * * *", "2026-01-01T10:15:30Z", false, "2026-01-02T10:15:30Z" },
+    month_names = { "0 0 1 jan,JUL *", "2026-01-01T00:00:00Z", false, "2026-07-01T00:00:00Z 2027-01-01T00:00:00Z" },
+    month_range = { "0 0 1 nov-dec *", "2026-01-01T00:00:00Z", false, "2026-11-01T00:00:00Z 2026-12-01T00:00:00Z 2027-11-01T00:00:00Z" },
+    weekdays = { "0 9 * * mon-fri", "2026-01-02T09:00:00Z", false, "2026-01-05T09:00:00Z 2026-01-06T09:00:00Z" },
+    sunday_as_seven = { "0 0 * * 7", "2026-01-01T00:00:00Z", false, "2026-01-04T00:00:00Z 2026-01-11T00:00:00Z" },
+    sunday_as_zero = { "0 0 * * 0", "2026-01-01T00:00:00Z", false, "2026-01-04T00:00:00Z" },
+    weekend_range = { "0 0 * * sat-sun", "2026-01-01T00:00:00Z", false, "2026-01-03T00:00:00Z 2026-01-04T00:00:00Z 2026-01-10T00:00:00Z" },
+    wrapped_days = { "0 0 * * fri-mon", "2026-01-01T00:00:00Z", false, "2026-01-02T00:00:00Z 2026-01-03T00:00:00Z 2026-01-04T00:00:00Z 2026-01-05T00:00:00Z 2026-01-09T00:00:00Z" },
+    day_or_weekday = { "0 0 13 * fri", "2026-01-01T00:00:00Z", false, "2026-01-02T00:00:00Z 2026-01-09T00:00:00Z 2026-01-13T00:00:00Z 2026-01-16T00:00:00Z" },
+    question_mark = { "0 0 13 * ?", "2026-01-01T00:00:00Z", false, "2026-01-13T00:00:00Z 2026-02-13T00:00:00Z" },
+    star_step_day = { "0 0 */10 * mon", "2026-01-01T00:00:00Z", false, "2026-01-05T00:00:00Z 2026-01-12T00:00:00Z 2026-01-19T00:00:00Z" },
+    month_end = { "0 0 31 * *", "2026-01-31T00:00:00Z", false, "2026-03-31T00:00:00Z 2026-05-31T00:00:00Z" },
+    year_end = { "59 23 31 12 *", "2026-12-31T23:59:00Z", false, "2027-12-31T23:59:00Z" },
+    leap_day = { "0 0 29 2 *", "2026-01-01T00:00:00Z", false, "2028-02-29T00:00:00Z 2032-02-29T00:00:00Z" },
+    never = { "0 0 30 2 *", "2026-01-01T00:00:00Z", false, "nil" },
+    last_day = { "0 0 L * *", "2028-01-31T00:00:00Z", false, "2028-02-29T00:00:00Z 2028-03-31T00:00:00Z 2028-04-30T00:00:00Z" },
+    last_friday = { "0 0 * * 5L", "2026-01-01T00:00:00Z", false, "2026-01-30T00:00:00Z 2026-02-27T00:00:00Z 2026-03-27T00:00:00Z" },
+    second_monday = { "0 0 * * mon#2", "2026-01-01T00:00:00Z", false, "2026-01-12T00:00:00Z 2026-02-09T00:00:00Z" },
+    fifth_friday = { "0 0 * * 5#5", "2026-01-01T00:00:00Z", false, "2026-01-30T00:00:00Z 2026-05-29T00:00:00Z" },
+    nearest_weekday = { "0 0 15W * *", "2026-01-16T00:00:00Z", false, "2026-02-16T00:00:00Z 2026-03-16T00:00:00Z 2026-04-15T00:00:00Z" },
+    nearest_weekday_saturday = { "0 0 15W * *", "2026-08-01T00:00:00Z", false, "2026-08-14T00:00:00Z" },
+    nearest_weekday_first = { "0 0 1W * *", "2026-07-31T00:00:00Z", false, "2026-08-03T00:00:00Z 2026-09-01T00:00:00Z" },
+    nearest_weekday_last = { "0 0 31W * *", "2026-05-01T00:00:00Z", false, "2026-05-29T00:00:00Z" },
+    yearly = { "@yearly", "2026-01-01T00:00:00Z", false, "2027-01-01T00:00:00Z" },
+    monthly = { "@monthly", "2026-01-15T00:00:00Z", false, "2026-02-01T00:00:00Z" },
+    weekly = { "@weekly", "2026-01-01T00:00:00Z", false, "2026-01-04T00:00:00Z" },
+    daily = { "@daily", "2026-01-01T12:00:00Z", false, "2026-01-02T00:00:00Z" },
+    hourly = { "@Hourly", "2026-01-01T12:00:00Z", false, "2026-01-01T13:00:00Z" },
+    paris_morning = { "0 9 * * mon-fri", "2026-07-02T13:15:00Z", "Europe/Paris", "2026-07-03T09:00:00+02:00 2026-07-06T09:00:00+02:00" },
+    paris_winter = { "0 9 * * *", "2026-01-10T12:00:00Z", "Europe/Paris", "2026-01-11T09:00:00+01:00" },
+    tokyo = { "0 0 * * *", "2026-01-01T00:00:00Z", "Asia/Tokyo", "2026-01-02T00:00:00+09:00" },
+    half_hour_zone = { "0 * * * *", "2026-01-01T00:00:00Z", "Asia/Kolkata", "2026-01-01T06:00:00+05:30 2026-01-01T07:00:00+05:30" },
+    utc_name = { "0 12 * * *", "2026-01-01T00:00:00Z", "UTC", "2026-01-01T12:00:00Z" },
+    -- New York springs forward on 2026-03-08: 02:00 EST becomes 03:00 EDT.
+    ny_gap_fixed = { "30 2 * * *", "2026-03-07T12:00:00Z", "America/New_York", "2026-03-08T03:00:00-04:00 2026-03-09T02:30:00-04:00" },
+    ny_gap_fixed_once = { "*/15 2 * * *", "2026-03-08T06:30:00Z", "America/New_York", "2026-03-08T03:00:00-04:00 2026-03-09T02:00:00-04:00" },
+    ny_gap_two_hours = { "0 2,3 * * *", "2026-03-08T05:00:00Z", "America/New_York", "2026-03-08T03:00:00-04:00 2026-03-09T02:00:00-04:00" },
+    ny_gap_before = { "30 1 * * *", "2026-03-08T05:00:00Z", "America/New_York", "2026-03-08T01:30:00-05:00 2026-03-09T01:30:00-04:00" },
+    ny_gap_after = { "0 3 * * *", "2026-03-08T05:00:00Z", "America/New_York", "2026-03-08T03:00:00-04:00 2026-03-09T03:00:00-04:00" },
+    ny_gap_hourly = { "30 * * * *", "2026-03-08T06:00:00Z", "America/New_York", "2026-03-08T01:30:00-05:00 2026-03-08T03:30:00-04:00 2026-03-08T04:30:00-04:00" },
+    ny_gap_interval = { "*/15 * * * *", "2026-03-08T06:40:00Z", "America/New_York", "2026-03-08T01:45:00-05:00 2026-03-08T03:00:00-04:00 2026-03-08T03:15:00-04:00" },
+    ny_gap_daily_noon = { "0 12 * * *", "2026-03-07T18:00:00Z", "America/New_York", "2026-03-08T12:00:00-04:00" },
+    -- New York falls back on 2026-11-01: 02:00 EDT becomes 01:00 EST.
+    ny_overlap_fixed = { "30 1 * * *", "2026-10-31T12:00:00Z", "America/New_York", "2026-11-01T01:30:00-04:00 2026-11-02T01:30:00-05:00" },
+    ny_overlap_fixed_from_second_pass = { "50 1 * * *", "2026-11-01T06:45:00Z", "America/New_York", "2026-11-02T01:50:00-05:00" },
+    ny_overlap_fixed_from_first_pass = { "50 1 * * *", "2026-11-01T05:45:00Z", "America/New_York", "2026-11-01T01:50:00-04:00 2026-11-02T01:50:00-05:00" },
+    ny_overlap_hourly = { "30 * * * *", "2026-11-01T04:00:00Z", "America/New_York", "2026-11-01T00:30:00-04:00 2026-11-01T01:30:00-04:00 2026-11-01T01:30:00-05:00 2026-11-01T02:30:00-05:00" },
+    ny_overlap_interval = { "*/30 * * * *", "2026-11-01T05:30:00Z", "America/New_York", "2026-11-01T01:00:00-05:00 2026-11-01T01:30:00-05:00 2026-11-01T02:00:00-05:00" },
+    ny_overlap_two = { "0 2 * * *", "2026-11-01T04:00:00Z", "America/New_York", "2026-11-01T02:00:00-05:00 2026-11-02T02:00:00-05:00" },
+    -- Paris springs forward on 2026-03-29: 02:00 CET becomes 03:00 CEST.
+    paris_gap_fixed = { "30 2 * * *", "2026-03-28T12:00:00Z", "Europe/Paris", "2026-03-29T03:00:00+02:00 2026-03-30T02:30:00+02:00" },
+    paris_gap_hourly = { "0 * * * *", "2026-03-29T00:30:00Z", "Europe/Paris", "2026-03-29T03:00:00+02:00 2026-03-29T04:00:00+02:00" },
+    paris_gap_interval = { "45 * * * *", "2026-03-29T00:00:00Z", "Europe/Paris", "2026-03-29T01:45:00+01:00 2026-03-29T03:45:00+02:00" },
+    -- Paris falls back on 2026-10-25: 03:00 CEST becomes 02:00 CET.
+    paris_overlap_fixed = { "30 2 * * *", "2026-10-24T12:00:00Z", "Europe/Paris", "2026-10-25T02:30:00+02:00 2026-10-26T02:30:00+01:00" },
+    paris_overlap_hourly = { "30 * * * *", "2026-10-24T23:45:00Z", "Europe/Paris", "2026-10-25T02:30:00+02:00 2026-10-25T02:30:00+01:00 2026-10-25T03:30:00+01:00" },
+    paris_overlap_three = { "0 3 * * *", "2026-10-24T12:00:00Z", "Europe/Paris", "2026-10-25T03:00:00+01:00" },
+    -- Sydney falls back on 2026-04-05: 03:00 AEDT becomes 02:00 AEST.
+    sydney_overlap_fixed = { "30 2 * * *", "2026-04-04T00:00:00Z", "Australia/Sydney", "2026-04-05T02:30:00+11:00 2026-04-06T02:30:00+10:00" },
+    -- Lord Howe Island moves its clock by half an hour: 02:00 becomes 02:30 on 2026-10-04.
+    lord_howe_gap = { "10,40 2 * * *", "2026-10-03T00:00:00Z", "Australia/Lord_Howe", "2026-10-04T02:30:00+11:00 2026-10-04T02:40:00+11:00 2026-10-05T02:10:00+11:00" },
+    -- An interval that waits months crosses changes of offset on the way.
+    interval_far = { "0 * 1 11 *", "2026-01-15T00:00:00Z", "America/New_York", "2026-11-01T00:00:00-04:00 2026-11-01T01:00:00-04:00 2026-11-01T01:00:00-05:00 2026-11-01T02:00:00-05:00" },
+}
+
+local function next_test(expression, after, zone, want)
+    local count = select(2, want:gsub("%S+", ""))
+    local got = run(expression, after, zone or nil, count)
+    assert(got == want, got)
+end
+
+local invalid_cases = {
+    { "", "expected 5 or 6 fields, found 0" },
+    { "* * *", "expected 5 or 6 fields, found 3" },
+    { "* * * * * * *", "expected 5 or 6 fields, found 7" },
+    { "60 * * * *", "bad minute value '60'" },
+    { "* 24 * * *", "bad hour value '24'" },
+    { "* * 0 * *", "bad day%-of%-month value '0'" },
+    { "* * * 13 *", "bad month value '13'" },
+    { "* * * * 8", "bad day%-of%-week value '8'" },
+    { "* * * foo *", "bad month value 'foo'" },
+    { "* * * * jan", "bad day%-of%-week value 'jan'" },
+    { "*/0 * * * *", "bad step in minute field" },
+    { "*/x * * * *", "bad step in minute field" },
+    { "30-10 * * * *", "bad range in minute field '30%-10'" },
+    { "1,,2 * * * *", "bad minute value ''" },
+    { "1.5 * * * *", "bad minute value '1.5'" },
+    { "-1 * * * *", "bad minute value" },
+    { "? * * * *", "bad minute value '%?'" },
+    { "L * * * *", "bad minute value 'l'" },
+    { "* * * * 5#6", "bad day%-of%-week value" },
+    { "@reboot", "expected 5 or 6 fields, found 1" },
+}
+
+local function invalid_test(expression, pattern)
+    local err = raises(function() cron.parse(expression) end, pattern)
+    assert(cron.iserror(err))
+    assert(err.expression == expression)
+    assert(tostring(err):find("invalid cron expression '", 1, true) == 1)
+end
+
+local function parse_object_test()
+    local c = cron.parse("  */5 * * * *  ")
+    assert(tostring(c) == "  */5 * * * *  ")
+    assert(c.seconds == false)
+    assert(cron.parse("0 * * * * *").seconds == true)
+    local start = time.parse("2026-01-01T00:01:00Z")
+    assert(c:next(start):iso() == "2026-01-01T00:05:00Z")
+    assert(cron.next(c, start):iso() == "2026-01-01T00:05:00Z")
+    assert(not cron.iserror(c))
+    raises(function() cron.parse(5) end, "string expected")
+end
+
+local function after_forms_test()
+    local paris = time.zone("Europe/Paris")
+    local i = time.parse("2026-07-02T13:15:00Z")
+    local want = "2026-07-03T09:00:00+02:00"
+    assert(cron.next("0 9 * * *", i, paris):iso() == want)
+    assert(cron.next("0 9 * * *", i:at(paris), "Europe/Paris"):iso() == want)
+    assert(cron.next("0 9 * * *", i:epoch(), paris):iso() == want)
+    assert(cron.next("0 9 * * *", i:epoch() + 0.75, paris):iso() == want)
+    -- The result is a zoned value in the zone of the call.
+    local z = cron.next("0 9 * * *", i, paris)
+    assert(z.hour == 9 and z.offset == 7200 and z:instant():iso() == "2026-07-03T07:00:00Z")
+    -- A fraction of a second after a match still counts as after it.
+    local late = time.instant(i:epoch(), 5)
+    assert(cron.next("15 13 * * *", late):iso() == "2026-07-03T13:15:00Z")
+    assert(cron.next("* * * * *"):instant() > time.now())
+    raises(function() cron.next("* * * * *", i, "Mars/Base") end, "unknown time zone")
+end
+
+-- Checks an expression against a search that tests every minute of a span.
+local function matches(fields, z)
+    local wd = tonumber(z.weekday) % 7
+    local dom_ok, dow_ok = fields.dom[z.day], fields.dow[wd]
+    local day_ok
+    if fields.dom_star and fields.dow_star then
+        day_ok = true
+    elseif fields.dom_star then
+        day_ok = dow_ok
+    elseif fields.dow_star then
+        day_ok = dom_ok
+    else
+        day_ok = dom_ok or dow_ok
+    end
+    return day_ok and fields.min[z.minute] and fields.hour[z.hour] and fields.month[z.month]
+end
+
+local function set(...)
+    local s = {}
+    for _, v in ipairs({ ... }) do
+        s[v] = true
+    end
+    return s
+end
+
+local function all(lo, hi)
+    local s = {}
+    for v = lo, hi do
+        s[v] = true
+    end
+    return s
+end
+
+local brute_cases = {
+    { "*/7 * * * *", "UTC", "2026-02-27T00:00:00Z", 3,
+        { min = set(0, 7, 14, 21, 28, 35, 42, 49, 56), hour = all(0, 23), dom = all(1, 31), month = all(1, 12), dow = all(0, 6), dom_star = true, dow_star = true } },
+    { "13 */5 1,15 * 3", "UTC", "2026-03-30T00:00:00Z", 20,
+        { min = set(13), hour = set(0, 5, 10, 15, 20), dom = set(1, 15), month = all(1, 12), dow = set(3) } },
+    { "*/10 * * * *", "America/New_York", "2026-03-07T12:00:00Z", 2,
+        { min = set(0, 10, 20, 30, 40, 50), hour = all(0, 23), dom = all(1, 31), month = all(1, 12), dow = all(0, 6), dom_star = true, dow_star = true } },
+    { "*/10 * * * sun", "America/New_York", "2026-10-31T12:00:00Z", 2,
+        { min = set(0, 10, 20, 30, 40, 50), hour = all(0, 23), dom = all(1, 31), month = all(1, 12), dow = set(0), dom_star = true } },
+    { "20 */2 * * *", "Europe/Paris", "2026-10-24T12:00:00Z", 2,
+        { min = set(20), hour = set(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22), dom = all(1, 31), month = all(1, 12), dow = all(0, 6), dom_star = true, dow_star = true } },
+    { "5 * * * *", "Australia/Lord_Howe", "2026-04-04T00:00:00Z", 2,
+        { min = set(5), hour = all(0, 23), dom = all(1, 31), month = all(1, 12), dow = all(0, 6), dom_star = true, dow_star = true } },
+}
+
+-- Every case has an hour field that starts with `*`, so each instant whose
+-- wall clock matches is a run, in a zone as in UTC.
+local function brute_test(expression, zone_name, start, days, fields)
+    local zone = time.zone(zone_name)
+    local origin = time.parse(start)
+    local want = {}
+    for minute = 1, days * 1440 do
+        local i = origin + time.minutes(minute)
+        if matches(fields, i:at(zone)) then
+            want[#want + 1] = i:epoch()
+        end
+    end
+    assert(#want > 0)
+    local c = cron.parse(expression)
+    local t = origin
+    for n = 1, #want do
+        t = c:next(t, zone):instant()
+        assert(t:epoch() == want[n], `match $n: got $(t:iso()), want $(time.instant(want[n]):iso())`)
+    end
+    assert(c:next(t, zone):instant() > origin + time.days(days))
+end
+
+-- A clock that only a sleep moves, so that a loop runs without waiting.
+local function fake(start)
+    local state = { now = time.parse(start):epoch(), sleeps = {} }
+    state.clock = function() return state.now end
+    state.sleep = function(seconds)
+        state.sleeps[#state.sleeps + 1] = seconds
+        state.now = state.now + seconds
+    end
+    return state
+end
+
+local function ticks_test()
+    local f = fake("2026-01-01T00:00:30Z")
+    local seen = {}
+    for at in cron.ticks("*/5 * * * *", { clock = f.clock, sleep = f.sleep, limit = 3 }) do
+        seen[#seen + 1] = at:iso() .. "@" .. f.now
+    end
+    local base = time.parse("2026-01-01T00:00:00Z"):epoch()
+    assert(table.concat(seen, " ") == `2026-01-01T00:05:00Z@$(base + 300) 2026-01-01T00:10:00Z@$(base + 600) 2026-01-01T00:15:00Z@$(base + 900)`)
+    -- Sleeps are bounded so that the loop reads the clock every minute.
+    assert(f.sleeps[1] == 60 and f.sleeps[5] == 30)
+end
+
+local function ticks_zone_test()
+    local f = fake("2026-03-07T12:00:00Z")
+    local seen = {}
+    for at in cron.ticks(cron.parse("30 2 * * *"), { clock = f.clock, sleep = f.sleep, zone = "America/New_York" }) do
+        seen[#seen + 1] = at:iso()
+        if #seen == 2 then
+            break
+        end
+    end
+    assert(table.concat(seen, " ") == "2026-03-08T03:00:00-04:00 2026-03-09T02:30:00-04:00")
+end
+
+local function ticks_after_test()
+    local f = fake("2026-01-01T00:00:00Z")
+    local options = { clock = f.clock, sleep = f.sleep, limit = 2, after = time.parse("2026-01-01T06:00:00Z") }
+    local seen = {}
+    for at in cron.ticks("0 * * * *", options) do
+        seen[#seen + 1] = at.hour
+    end
+    assert(table.concat(seen, " ") == "7 8")
+    -- A start in the past counts as the current time.
+    options.after = 0
+    for at in cron.ticks("0 * * * *", options) do
+        seen[#seen + 1] = at.hour
+    end
+    assert(table.concat(seen, " ") == "7 8 9 10")
+end
+
+local function ticks_skip_matches_during_the_body_test()
+    local f = fake("2026-01-01T00:00:00Z")
+    local seen = {}
+    for at in cron.ticks("* * * * *", { clock = f.clock, sleep = f.sleep, limit = 3 }) do
+        seen[#seen + 1] = at.minute
+        f.now = f.now + 150
+    end
+    assert(table.concat(seen, " ") == "1 4 7")
+end
+
+local function ticks_without_match_test()
+    local f = fake("2026-01-01T00:00:00Z")
+    for _ in cron.ticks("0 0 30 2 *", { clock = f.clock, sleep = f.sleep }) do
+        error("never")
+    end
+    assert(#f.sleeps == 0)
+    raises(function() cron.ticks("nope") end, "invalid cron expression")
+    raises(function() cron.ticks("* * * * *", { zone = "Mars/Base" }) end, "unknown time zone")
+end
+
+local function schedule_returns_a_coroutine_test()
+    local f = fake("2026-01-01T00:00:30Z")
+    local seen = {}
+    local co = cron.schedule("*/5 * * * *", function(at) seen[#seen + 1] = at.minute end,
+        { clock = f.clock, sleep = f.sleep, limit = 3 })
+    assert(type(co) == "thread" and #seen == 0)
+    assert(coroutine.resume(co) == true)
+    assert(table.concat(seen, " ") == "5 10 15")
+    assert(coroutine.status(co) == "dead")
+end
+
+local function schedule_close_test()
+    local f = fake("2026-01-01T00:00:00Z")
+    local runs = 0
+    local co
+    co = cron.schedule("* * * * *", function()
+        runs = runs + 1
+        coroutine.yield()
+    end, { clock = f.clock, sleep = f.sleep })
+    -- Let the schedule run once and stop at its yield.
+    coroutine.resume(coroutine.detach(coroutine.create(function() coroutine.yield() end)))
+    assert(runs >= 1)
+    local before = runs
+    assert(coroutine.close(co))
+    assert(coroutine.status(co) == "dead")
+    coroutine.resume(coroutine.detach(coroutine.create(function() coroutine.yield() end)))
+    assert(runs == before)
+    -- A schedule closed before its first turn never runs.
+    local idle = cron.schedule("* * * * *", function() runs = runs + 1 end, { clock = f.clock, sleep = f.sleep })
+    coroutine.close(idle)
+    coroutine.resume(coroutine.detach(coroutine.create(function() coroutine.yield() end)))
+    assert(runs == before)
+end
+
+local function schedule_error_test()
+    local f = fake("2026-01-01T00:00:00Z")
+    local co = cron.schedule("* * * * *", function() error("boom", 0) end, { clock = f.clock, sleep = f.sleep })
+    local ok, err = coroutine.resume(co)
+    assert(ok == false and err == "boom")
+    -- A function that catches its errors keeps its schedule.
+    local errors = {}
+    co = cron.schedule("* * * * *", function()
+        local done, problem = catch error("soft", 0)
+        errors[#errors + 1] = tostring(done) .. problem
+    end, { clock = f.clock, sleep = f.sleep, limit = 2 })
+    assert(coroutine.resume(co))
+    assert(table.concat(errors, " ") == "falsesoft falsesoft")
+    raises(function() cron.schedule("nope", function() end) end, "invalid cron expression")
+    raises(function() cron.schedule("* * * * *", function() end, { zone = "Mars/Base" }) end, "unknown time zone")
+end
+
+-- The default timer needs a UDP socket, which a sandbox may refuse.
+local function real_timer_test()
+    local ok, sock = catch network.udp.open()
+    if not ok then
+        skip("cannot open a UDP socket here")
+    end
+    sock:close()
+    local started = time.monotonic()
+    -- In the main chunk the iterator blocks and runs the detached coroutines.
+    local other = 0
+    local stop = false
+    local ticker = coroutine.detach(coroutine.create(function()
+        while not stop do
+            other = other + 1
+            coroutine.yield()
+        end
+    end))
+    local at
+    for t in cron.ticks("* * * * * *", { limit = 1 }) do
+        at = t
+    end
+    assert(at ~= nil and other > 0)
+    assert((time.monotonic() - started):seconds() < 1.5)
+    assert(math.abs((time.now() - at:instant()):seconds()) < 0.5)
+    local ran
+    local co = cron.schedule("* * * * * *", function(t) ran = t end, { limit = 1 })
+    assert(coroutine.resume(co) and ran ~= nil)
+    stop = true
+    coroutine.resume(ticker)
+    -- Closing a schedule that sleeps ends it and its timer at once.
+    local slow = cron.schedule("0 0 1 1 *", function() end)
+    coroutine.resume(coroutine.detach(coroutine.create(function() coroutine.yield() end)))
+    started = time.monotonic()
+    assert(coroutine.close(slow))
+    assert((time.monotonic() - started):seconds() < 0.5)
+end
