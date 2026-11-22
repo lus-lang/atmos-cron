@@ -1,6 +1,6 @@
 local ROOT = string.match(TEST_DIR, "^(.*)[/\\][^/\\]*$")
-pledge("load", "fs:read=" .. ROOT .. "/*", "network:udp")
-package.path = ROOT .. "/?.lus;" .. package.path
+pledge("load", `fs:read=$ROOT/*`, "network:udp")
+package.path = `$ROOT/?.lus;$(package.path)`
 
 local cron = require("cron")
 
@@ -243,7 +243,7 @@ local function ticks_test()
     local f = fake("2026-01-01T00:00:30Z")
     local seen = {}
     for at in cron.ticks("*/5 * * * *", { clock = f.clock, sleep = f.sleep, limit = 3 }) do
-        seen[#seen + 1] = at:iso() .. "@" .. f.now
+        seen[#seen + 1] = `$(at:iso())@$(f.now)`
     end
     local base = time.parse("2026-01-01T00:00:00Z"):epoch()
     assert(table.concat(seen, " ") == `2026-01-01T00:05:00Z@$(base + 300) 2026-01-01T00:10:00Z@$(base + 600) 2026-01-01T00:15:00Z@$(base + 900)`)

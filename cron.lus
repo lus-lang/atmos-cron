@@ -1,34 +1,35 @@
---- Parses cron expressions, computes their next times in a time zone, and runs functions on a schedule.
+--- Parses cron expressions, computes their next times in a time zone, and
+--- runs functions on a schedule.
 ---
 --- An expression has five fields, `minute hour day-of-month month
 --- day-of-week`, or six with a leading `second` field. `cron.parse` reads one
 --- into an object. `cron.next` returns the next matching time as a
 --- `time.zoned` value. `cron.ticks` returns an iterator that sleeps until each
---- match, and `cron.schedule` runs such a loop in a detached coroutine.
+--- match. `cron.schedule` runs such a loop in a detached coroutine.
 ---
---- A field holds `*`, a value, a range `a-b`, a step `*/n`, `a-b/n`, or `a/n`,
---- or a list of these separated by commas. Months accept the names `jan` to
---- `dec`. Days of the week accept `sun` to `sat` and the numbers 0 to 7,
---- where 0 and 7 are both Sunday. `?` means `*` in the two day fields. The
---- day-of-month field also accepts `L`, the last day of the month, and `15W`,
---- the weekday nearest to the 15th. The day-of-week field also accepts `5L`,
---- the last Friday of the month, and `5#2`, the second Friday. When both day
---- fields are restricted, a day matches when either field matches. The
---- nicknames are `@yearly`, `@annually`, `@monthly`, `@weekly`, `@daily`,
---- `@midnight`, and `@hourly`.
+--- A field holds `*`, a value, a range `a-b`, a step `*/n`, `a-b/n`, or
+--- `a/n`, or a list of these separated by commas. Months accept the names
+--- `jan` to `dec`. Days of the week accept `sun` to `sat` and the numbers 0
+--- to 7, where 0 and 7 are both Sunday. `?` means `*` in the two day fields.
+--- The day-of-month field also accepts `L` for the last day of the month and
+--- `15W` for the weekday nearest to the 15th. The day-of-week field also
+--- accepts `5L` for the last Friday of the month and `5#2` for the second
+--- Friday. When both day fields are restricted, a day matches when either
+--- field matches. The nicknames are `@yearly`, `@annually`, `@monthly`,
+--- `@weekly`, `@daily`, `@midnight`, and `@hourly`.
 ---
 --- Times are wall-clock times in the zone of the call. Daylight saving time
---- changes follow the rules of Vixie cron. They depend on the hour field.
---- An expression whose hour field starts with `*` is an interval. It follows
---- the clock through a change, so `*/15 * * * *` runs every 15 minutes of
---- elapsed time, including in both passes through a repeated hour. An
---- expression with a fixed hour names times of day. A time that the zone
---- skips runs once at the instant the skip ends, so `30 2 * * *` runs at
---- 03:00 on the day the clock jumps from 02:00 to 03:00. A time that the zone
---- repeats runs once, in the first pass.
+--- changes follow the rules of Vixie cron, which depend on the hour field.
+--- An expression whose hour field starts with `*` is an interval that counts
+--- elapsed time across a change, so `*/15 * * * *` runs every 15 minutes,
+--- including both passes through a repeated hour. An expression with a fixed
+--- hour names times of day, each of which runs once. A time that the zone
+--- skips runs at the instant the skip ends, so `30 2 * * *` runs at 03:00 on
+--- the day the clock jumps from 02:00 to 03:00. A time that the zone repeats
+--- runs in the first pass.
 ---
 --- @package cron
---- @version 0.1.0
+--- @version 1.0.0
 --- @lus 2.0
 --- @license 0BSD
 --- @repository https://github.com/lus-lang/atmos-cron
@@ -44,7 +45,7 @@ CronError.__tostring = function(e) return e.message end
 ---
 --- The error object has a `message` and the `expression` that failed.
 --- @param value any The value to test.
---- @return boolean
+--- @return boolean True for an error object of `cron.parse`.
 function M.iserror(value)
     return getmetatable(value) == CronError
 end
@@ -178,14 +179,16 @@ Cron.__tostring = function(c) return c.expression end
 
 --- Parses a cron expression and returns an object.
 ---
---- The object has the field `expression`, the text it was parsed from, and
---- the boolean `seconds`, which is true for a six-field expression. Its
---- method `c:next(after, zone)` works as `cron.next` does. `tostring` returns
---- the expression. Names and nicknames are read without regard to case.
+--- The field `expression` of the object is the text it was parsed from. The
+--- boolean field `seconds` is true for a six-field expression. The method
+--- `c:next(after, zone)` works as `cron.next` does. `tostring` returns the
+--- expression. Names and nicknames match without regard to case.
 ---
---- The call raises an error object, which `cron.iserror` recognizes, when the expression has a wrong number of fields, a value out of range, or a malformed item.
+--- The call raises an error object, which `cron.iserror` recognizes, when the
+--- expression has a wrong number of fields, a value out of range, or a
+--- malformed item.
 --- @param expression string The expression, such as `"*/5 * * * *"` or `"@daily"`.
---- @return table
+--- @return table The parsed expression.
 function M.parse(expression)
     if type(expression) ~= "string" then
         error("bad argument #1 to 'parse' (string expected)", 2)
@@ -509,9 +512,11 @@ end
 --- later than `after`, so passing a result back gives the following match.
 --- `zone` is the zone whose wall clock the expression describes. It is a zone
 --- from `time.zone`, an IANA name such as `"Europe/Paris"`, or nil for UTC.
---- The package overview states what happens at a daylight saving change.
+--- Daylight saving time changes follow the rules in the package overview.
 ---
---- An expression that is not a parsed object is parsed first, which raises the errors of `cron.parse`. An unknown zone name raises the error of `time.zone`.
+--- An expression that is not a parsed object is parsed first, which raises
+--- the errors of `cron.parse`. An unknown zone name raises the error of
+--- `time.zone`.
 --- @param expression string|table An expression or an object from `cron.parse`.
 --- @param after any? The time to start from.
 --- @param zone any? The zone, which defaults to UTC.
@@ -563,26 +568,29 @@ end
 
 local MAX_SLEEP = 60
 
---- Returns an iterator that waits for each match of an expression and returns its time.
+--- Returns an iterator that waits for each match of an expression and returns
+--- its time.
 ---
 --- Each call of the iterator sleeps until the next match and returns it as a
 --- `time.zoned` value, so a `for` loop runs its body once per match. Inside a
---- detached coroutine the sleep suspends the coroutine while the others run.
---- In the main chunk it blocks the chunk and runs the detached coroutines
---- meanwhile. A match that passes while the body of the loop runs is skipped,
---- so the following turn waits for the first match after the body ended. The
---- loop ends when the expression has no further match, and `break` leaves it
---- at any time.
+--- detached coroutine, the sleep suspends that coroutine while the others run.
+--- In the main chunk, it blocks the chunk while the detached coroutines run.
+--- A match that passes while the body of the loop runs is skipped, so the
+--- following turn waits for the first match after the body ended. The loop
+--- ends when the expression has no further match or when its body runs
+--- `break`.
 ---
 --- The options are:
 ---
 --- - `zone`, a zone or an IANA name, which defaults to UTC.
---- - `after`, the time from which the first match counts, in any form that `cron.next` accepts. It defaults to the current time, and a time in the past counts as the current time.
+--- - `after`, the time from which the first match counts, in any form that `cron.next` accepts. It defaults to the current time. A time in the past counts as the current time.
 --- - `limit`, the number of matches after which the iterator returns nil.
 --- - `clock`, a function that returns the time in Unix seconds, which defaults to the system clock.
 --- - `sleep`, a function that suspends its caller for a number of seconds. The default waits on the receive timeout of an unbound UDP socket, which needs the `network:udp` permission.
 ---
---- The call raises the errors of `cron.parse` and of `time.zone`. With the default timer, the first turn raises a permission error when the program lacks `network:udp`.
+--- The call raises the errors of `cron.parse` and of `time.zone`. With the
+--- default timer, the first turn raises a permission error when the program
+--- lacks `network:udp`.
 --- @param expression string|table An expression or an object from `cron.parse`.
 --- @param options table? The options.
 --- @return function The iterator.
@@ -627,20 +635,21 @@ local function run_schedule(expression, fn, options)
     end
 end
 
---- Runs a function at every match of an expression and returns the detached coroutine that does so.
+--- Runs a function at every match of an expression and returns the detached
+--- coroutine that does so.
 ---
 --- The coroutine runs `for at in cron.ticks(expression, options) do fn(at)
---- end`, so the function receives each scheduled time as a `time.zoned` value
---- and the options are those of `cron.ticks`. The program stays alive while
---- the coroutine runs, as it does for every detached coroutine.
+--- end`, so the function receives each scheduled time as a `time.zoned`
+--- value. The options are those of `cron.ticks`. The program stays alive
+--- while the coroutine runs, as it does for every detached coroutine.
 ---
 --- The coroutine is the handle of the schedule. `coroutine.close` on it
---- stops the schedule, also in the middle of a sleep. `coroutine.resume` on
+--- stops the schedule, even in the middle of a sleep. `coroutine.resume` on
 --- it waits until the schedule has ended, which happens after `limit` runs
 --- or when the expression has no further match. An error that the function
---- raises ends the coroutine. The resume then returns false and the error,
---- and an error that no resume collects stops the program. A function that
---- wraps its work in `catch` keeps its schedule running past errors.
+--- raises ends the coroutine, so the resume returns false and the error
+--- object. An error that no resume collects stops the program. A function
+--- that wraps its work in `catch` keeps its schedule running past errors.
 ---
 --- The call raises the errors of `cron.parse` and of `time.zone`.
 --- @param expression string|table An expression or an object from `cron.parse`.

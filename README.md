@@ -1,6 +1,8 @@
 # cron
 
-Parses cron expressions, computes their next times in a time zone, and runs loops and functions on a schedule with coroutines.
+`cron` parses cron expressions, computes their next times in a time zone, and runs loops and functions on a schedule with coroutines.
+
+The following example schedules the recurring jobs of an application in two time zones.
 
 ```lus nocheck
 local cron = require("https://atmosp.here/2.0/cron.lus")
@@ -12,13 +14,13 @@ for at in cron.ticks("0 * * * *", { limit = 3 }) do
     print("on the hour", at:iso())
 end
 
--- The same loop in a detached coroutine, which is the handle of the schedule.
+-- The same loop in a detached coroutine, which `cron.schedule` returns as the handle of the schedule.
 local cleanup = cron.schedule("*/5 * * * *", function(at)
     print("cleanup at", at:iso())
 end, { zone = "America/New_York" })
 coroutine.close(cleanup)
 ```
 
-The package requires Lus 2.0. It needs `network:udp` for the timer of `cron.ticks` and `cron.schedule`, which waits on the receive timeout of an unbound UDP socket. `cron.parse` and `cron.next` need no permissions. It calls no `pledge` of its own, so the program that loads it keeps control of its permissions.
+The package requires Lus 2.0 and declares the permission `network:udp`, which only the timer of `cron.ticks` and `cron.schedule` uses. It never calls `pledge`, so the program that loads it keeps control of its permissions.
 
-The reference is in the doc comments of `cron.lus`. Run `lus doc cron.lus` to print it.
+The reference is in the doc comments of `cron.lus`, which `lus doc cron.lus` prints.
