@@ -28,6 +28,27 @@
 --- the day the clock jumps from 02:00 to 03:00. A time that the zone repeats
 --- runs in the first pass.
 ---
+--- The following example schedules the recurring jobs of an application in
+--- two time zones.
+---
+--- ```lus nocheck
+--- local cron = require("https://atmosp.here/2.0/cron.lus")
+---
+--- print(cron.next("0 9 * * mon-fri", time.now(), "Europe/Paris"):iso())
+---
+--- -- A loop that sleeps until each match.
+--- for at in cron.ticks("0 * * * *", { limit = 3 }) do
+---     print("on the hour", at:iso())
+--- end
+---
+--- -- The same loop in a detached coroutine, which is the handle of the schedule.
+--- local cleanup = cron.schedule("*/5 * * * *", function(at)
+---     print("cleanup at", at:iso())
+--- end, { zone = "America/New_York" })
+---
+--- coroutine.close(cleanup)
+--- ```
+---
 --- @package cron
 --- @version 1.0.0
 --- @lus 2.0
@@ -38,7 +59,10 @@ local M = {}
 
 local CronError = {}
 CronError.__index = CronError
-CronError.__tostring = function(e) return e.message end
+
+CronError.__tostring = function(e)
+    return e.message
+end
 
 --- Returns true if `value` is an error object that `cron.parse` raised.
 ---
@@ -59,7 +83,20 @@ local NICKNAMES = {
     ["@hourly"] = "0 * * * *",
 }
 
-local MONTHS = { jan = 1, feb = 2, mar = 3, apr = 4, may = 5, jun = 6, jul = 7, aug = 8, sep = 9, oct = 10, nov = 11, dec = 12 }
+local MONTHS = {
+    jan = 1,
+    feb = 2,
+    mar = 3,
+    apr = 4,
+    may = 5,
+    jun = 6,
+    jul = 7,
+    aug = 8,
+    sep = 9,
+    oct = 10,
+    nov = 11,
+    dec = 12,
+}
 local DAYS = { sun = 0, mon = 1, tue = 2, wed = 3, thu = 4, fri = 5, sat = 6 }
 
 -- name, low, high, names
@@ -73,13 +110,12 @@ local SPECS = {
 }
 
 local function number(text, spec)
-    local n = math.tointeger(tonumber(text))
-    if n == nil and spec[4] then
-        n = spec[4][text]
-    end
+    local n = math.tointeger(tonumber(text)) or spec[4]?[text]
+
     if n == nil or n < spec[2] or n > spec[3] or text:find("^[%d%a]+$") == nil then
         return nil, `bad $(spec[1]) value '$text'`
     end
+
     return n
 end
 
@@ -91,58 +127,74 @@ local function parse_field(text, spec)
     local field = { set = {}, star = false }
     local first = text:sub(1, 1)
     field.star = first == "*" or first == "?"
+
     for item in (text .. ","):gmatch("([^,]*),") do
         local body, step = item, 1
         local slash = item:find("/", 1, true)
+
         if slash then
             body = item:sub(1, slash - 1)
             step = math.tointeger(tonumber(item:sub(slash + 1)))
+
             if step == nil or step < 1 then
                 return nil, `bad step in $(spec[1]) field '$item'`
             end
         end
+
         local a, b
+
         if body == "*" or (body == "?" and (is_dow or is_dom)) then
             a, b = lo, is_dow and 6 or hi
         elseif is_dom and body == "l" then
             field.last = true
         elseif is_dom and body:find("^%d+w$") then
             local n, err = number(body:sub(1, -2), spec)
+
             if n == nil then
                 return nil, err
             end
+
             field.weekdays = field.weekdays or {}
             field.weekdays[#field.weekdays + 1] = n
         elseif is_dow and body:find("^%w+l$") then
             local n, err = number(body:sub(1, -2), spec)
+
             if n == nil then
                 return nil, err
             end
+
             field.last_days = field.last_days or {}
             field.last_days[n % 7] = true
         elseif is_dow and body:find("#", 1, true) then
             local day, nth = body:match("^(%w+)#([1-5])$")
             local n, err = number(day or "", spec)
+
             if n == nil then
                 return nil, err or `bad $(spec[1]) value '$body'`
             end
+
             field.nth = field.nth or {}
             field.nth[#field.nth + 1] = { n % 7, math.tointeger(tonumber(nth)) }
         else
             local low, high = body:match("^([^-]+)-([^-]+)$")
             local err
             a, err = number(low or body, spec)
+
             if a == nil then
                 return nil, err
             end
+
             if high then
                 b, err = number(high, spec)
+
                 if b == nil then
                     return nil, err
                 end
+
                 if is_dow and b < a then
                     b = b + 7
                 end
+
                 if b < a then
                     return nil, `bad range in $(spec[1]) field '$body'`
                 end
@@ -152,21 +204,26 @@ local function parse_field(text, spec)
                 b = a
             end
         end
+
         if a then
             for v = a, b, step do
                 field.set[is_dow and v % 7 or v] = true
             end
         end
     end
+
     -- next[v - lo + 1] is the smallest member at or above v, or false.
     local following = false
     local nexts = {}
+
     for v = hi, lo, -1 do
         if field.set[v] then
             following = v
         end
+
         nexts[v - lo + 1] = following
     end
+
     field.next = nexts
     field.first = following
     return field
@@ -174,7 +231,10 @@ end
 
 local Cron = {}
 Cron.__index = Cron
-Cron.__tostring = function(c) return c.expression end
+
+Cron.__tostring = function(c)
+    return c.expression
+end
 
 --- Parses a cron expression and returns an object.
 ---
@@ -192,40 +252,55 @@ function M.parse(expression)
     if type(expression) ~= "string" then
         error("bad argument #1 to 'parse' (string expected)", 2)
     end
+
     local text = expression:lower():match("^%s*(.-)%s*$")
     text = NICKNAMES[text] or text
     local parts = {}
+
     for part in text:gmatch("%S+") do
         parts[#parts + 1] = part
     end
+
     local message
     local c = { expression = expression, seconds = #parts == 6 }
+
     if #parts ~= 5 and #parts ~= 6 then
         message = `expected 5 or 6 fields, found $(#parts)`
     else
         local shift = 6 - #parts
         local fields = {}
+
         for i = 1, #parts do
             local field, err = parse_field(parts[i], SPECS[i + shift])
+
             if field == nil then
                 message = err
                 break
             end
+
             fields[i + shift] = field
         end
+
         if message == nil then
             c.sec = fields[1] or parse_field("0", SPECS[1])
-            c.min, c.hour, c.dom, c.month, c.dow = fields[2], fields[3], fields[4], fields[5], fields[6]
+            c.min, c.hour, c.dom = fields[2], fields[3], fields[4]
+            c.month, c.dow = fields[5], fields[6]
             c.dom_special = c.dom.last or c.dom.weekdays ~= nil
             c.dow_special = c.dow.last_days ~= nil or c.dow.nth ~= nil
+
             if not c.month.first then
                 message = "the month field is empty"
             end
         end
     end
+
     if message then
-        error(setmetatable({ message = `invalid cron expression '$expression': $message`, expression = expression }, CronError), 2)
+        error(setmetatable({
+            message = `invalid cron expression '$expression': $message`,
+            expression = expression,
+        }, CronError), 2)
     end
+
     return setmetatable(c, Cron)
 end
 
@@ -235,6 +310,7 @@ local function days_from_civil(y, m, d)
     if m <= 2 then
         y = y - 1
     end
+
     local era = y // 400
     local yoe = y - era * 400
     local doy = (153 * (m > 2 and m - 3 or m + 9) + 2) // 5 + d - 1
@@ -260,6 +336,7 @@ local function days_in_month(y, m)
     if m == 2 and y % 4 == 0 and (y % 100 ~= 0 or y % 400 == 0) then
         return 29
     end
+
     return MONTH_DAYS[m]
 end
 
@@ -268,26 +345,32 @@ local function nearest_weekday(n, d, wd, dim)
     if wd == 0 or wd == 6 then
         return false
     end
+
     if n > dim then
         n = dim
     end
+
     if d == n then
         return true
     end
+
     -- A Saturday target moves to the Friday before, and a Sunday target to the
     -- Monday after. A target at an end of the month stays inside the month.
     if wd == 5 and d == n - 1 then
         return true
     end
+
     if wd == 1 and (d == n + 1 or (n == 1 and d == 3)) then
         return true
     end
+
     return wd == 5 and n == dim and d == n - 2
 end
 
 local function day_matches(c, d, wd, dim)
     local dom, dow from c
     local dom_ok = dom.set[d] == true
+
     if not dom_ok and c.dom_special then
         if dom.last and d == dim then
             dom_ok = true
@@ -300,13 +383,16 @@ local function day_matches(c, d, wd, dim)
             end
         end
     end
+
     local dow_ok = dow.set[wd] == true
+
     if not dow_ok and c.dow_special then
         if dow.last_days and dow.last_days[wd] and d + 7 > dim then
             dow_ok = true
         elseif dow.nth then
             for i = 1, #dow.nth do
                 local item = dow.nth[i]
+
                 if item[1] == wd and (d - 1) // 7 + 1 == item[2] then
                     dow_ok = true
                     break
@@ -314,11 +400,13 @@ local function day_matches(c, d, wd, dim)
             end
         end
     end
+
     if dom.star then
         return dow_ok
     elseif dow.star then
         return dom_ok
     end
+
     return dom_ok or dow_ok
 end
 
@@ -333,47 +421,61 @@ local function next_wall(c, naive)
     local h, mi, s = rest // 3600, rest % 3600 // 60, rest % 60
     local months, hours, minutes, seconds = c.month.next, c.hour.next, c.min.next, c.sec.next
     local limit = y + SEARCH_YEARS
+
     while y <= limit do
         local nm = months[mo]
+
         if nm ~= mo then
             if not nm then
                 y = y + 1
                 nm = c.month.first
             end
+
             mo, d, h, mi, s = nm, 1, 0, 0, 0
         end
+
         local dim = days_in_month(y, mo)
         local first = days_from_civil(y, mo, 1)
+
         while d <= dim do
             if day_matches(c, d, (first + d + 3) % 7, dim) then
                 while h <= 23 do
                     local nh = hours[h + 1]
+
                     if not nh then
                         break
                     end
+
                     if nh ~= h then
                         h, mi, s = nh, 0, 0
                     end
+
                     if nmi = mi <= 59 and minutes[mi + 1] then
                         if nmi ~= mi then
                             mi, s = nmi, 0
                         end
+
                         if ns = seconds[s + 1] then
                             return (first + d - 1) * 86400 + h * 3600 + mi * 60 + ns
                         end
+
                         mi, s = mi + 1, 0
                     else
                         h, mi, s = h + 1, 0, 0
                     end
                 end
             end
+
             d, h, mi, s = d + 1, 0, 0, 0
         end
+
         mo, d = mo + 1, 1
+
         if mo > 12 then
             mo, y = 1, y + 1
         end
     end
+
     return nil
 end
 
@@ -385,28 +487,36 @@ local instant = time.instant
 local function first_transition(zone, lo, hi)
     local before = zone:offset(instant(lo))
     local t = lo
+
     while true do
         local n = t + 86400
+
         if n > hi then
             n = hi
         end
+
         if zone:offset(instant(n)) ~= before then
             lo, hi = t, n
             break
         end
+
         if n == hi then
             return hi
         end
+
         t = n
     end
+
     while hi - lo > 1 do
         local mid = (lo + hi) // 2
+
         if zone:offset(instant(mid)) == before then
             lo = mid
         else
             hi = mid
         end
     end
+
     return hi
 end
 
@@ -415,41 +525,55 @@ local function next_epoch(c, after, zone)
     if zone == nil then
         return next_wall(c, after + 1)
     end
+
     local off = zone:offset(instant(after))
     local start = after + off + 1
+
     if c.hour.star then
         -- An interval follows the clock across each change of offset.
         local base = after
+
         for _ = 1, 8 do
             local wall = next_wall(c, start)
+
             if wall == nil then
                 return nil
             end
+
             local at = wall - off
+
             if zone:offset(instant(at)) == off then
                 return at
             end
+
             base = first_transition(zone, base, at)
             off = zone:offset(instant(base))
             start = base + off
         end
+
         return nil
     end
+
     for _ = 1, 8 do
         local wall = next_wall(c, start)
+
         if wall == nil then
             return nil
         end
+
         -- Resolve the wall-clock time with the offsets in force a day before
         -- and a day after it. A repeated time has two instants and resolves
         -- to the first. A skipped time has none and runs when the skip ends.
         local guess = wall - off
-        local before, later = zone:offset(instant(guess - 86400)), zone:offset(instant(guess + 86400))
+        local before = zone:offset(instant(guess - 86400))
+        local later = zone:offset(instant(guess + 86400))
         local at = wall - before
+
         if before ~= later then
             local other = wall - later
             local valid = zone:offset(instant(at)) == before
             local other_valid = zone:offset(instant(other)) == later
+
             if valid and other_valid then
                 at = at < other and at or other
             elseif other_valid then
@@ -458,11 +582,14 @@ local function next_epoch(c, after, zone)
                 at = first_transition(zone, at < other and at or other, at < other and other or at)
             end
         end
+
         if at > after then
             return at
         end
+
         start = wall + 1
     end
+
     return nil
 end
 
@@ -472,14 +599,18 @@ local function resolve_zone(zone)
     if zone == nil then
         return nil
     end
+
     if type(zone) == "string" then
         local z = zones[zone]
+
         if z == nil then
             z = time.zone(zone)
             zones[zone] = z
         end
+
         return z
     end
+
     return zone
 end
 
@@ -487,21 +618,24 @@ local function epoch_of(after)
     if after == nil then
         return time.now():epoch()
     end
+
     if type(after) == "number" then
         return math.floor(after)
     end
+
     if after.instant then
         return after:instant():epoch()
     end
+
     return after:epoch()
 end
 
 local function next_zoned(c, after, zone)
-    local at = next_epoch(c, epoch_of(after), zone)
-    if at == nil then
-        return nil
+    if at = next_epoch(c, epoch_of(after), zone) then
+        return instant(at):at(zone or 0)
     end
-    return instant(at):at(zone or 0)
+
+    return nil
 end
 
 --- Returns the first time after `after` that an expression matches.
@@ -524,6 +658,7 @@ function M.next(expression, after, zone)
     if getmetatable(expression) ~= Cron then
         expression = M.parse(expression)
     end
+
     return next_zoned(expression, after, resolve_zone(zone))
 end
 
@@ -572,6 +707,7 @@ function M.ticks(expression, options)
     if getmetatable(expression) ~= Cron then
         expression = M.parse(expression)
     end
+
     options = options or {}
     local zone = resolve_zone(options.zone)
     local clock = options.clock or now_seconds
@@ -579,24 +715,31 @@ function M.ticks(expression, options)
     local limit = options.limit
     local last = options.after ~= nil and epoch_of(options.after) or math.mininteger
     local count = 0
+
     return function()
         if limit and count >= limit then
             return nil
         end
+
         local now = math.floor(clock())
         local target = next_epoch(expression, now > last and now or last, zone)
+
         if target == nil then
             return nil
         end
+
         -- The wall clock may jump during a sleep, so sleep in bounded
         -- steps and read the clock again after each one.
         while true do
             local remaining = target - clock()
+
             if remaining <= 0 then
                 break
             end
+
             wait(remaining < MAX_SLEEP and remaining or MAX_SLEEP)
         end
+
         last = target
         count = count + 1
         return instant(target):at(zone or 0)
@@ -634,9 +777,11 @@ function M.schedule(expression, fn, options)
     if getmetatable(expression) ~= Cron then
         expression = M.parse(expression)
     end
-    if options and options.zone then
+
+    if options?.zone then
         resolve_zone(options.zone)
     end
+
     return coroutine.detach(coroutine.create(run_schedule), expression, fn, options)
 end
 
